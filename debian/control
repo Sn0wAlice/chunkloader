@@ -1,0 +1,14 @@
+Package: chunkloader
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: ${ARCH}
+Maintainer: Sn0wAlice <github@sn0w.io>
+Homepage: https://github.com/Sn0wAlice/chunkloader
+Description: Dump webpack / Next.js / Framer / Flutter JS chunks and assets for analysis
+ chunkloader takes a domain or a JS entry URL, discovers every referenced
+ chunk or asset, and downloads them into a local folder for offline analysis.
+ It handles webpack and Next.js chunk maps (including __BUILD_MANIFEST),
+ native ESM bundles (Framer / rolldown / rollup / Vite) by recursively
+ crawling the import graph, and Flutter web apps by reading the
+ flutter_service_worker.js resource manifest.

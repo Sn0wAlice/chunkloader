@@ -7,3 +7,10 @@
 # Editor / OS
 .idea/
 .DS_Store
+
+# Packaging artifacts
+*.deb
+*.tar.gz
+/debian/chunkloader/
+/debian/.debhelper/
+/debian/files

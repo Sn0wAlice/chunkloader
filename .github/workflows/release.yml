@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: chunkloader-linux-amd64
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: chunkloader-linux-arm64
+            deb_arch: arm64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: chunkloader-darwin-arm64
+            deb_arch: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.name }}.tar.gz chunkloader
+          cd ../../..
+
+      - name: Build .deb package
+        if: matrix.deb_arch != ''
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          bash scripts/build-deb.sh \
+            target/${{ matrix.target }}/release/chunkloader \
+            ${{ matrix.deb_arch }} \
+            "$VERSION"
+
+      - name: Upload tar.gz artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.tar.gz
+
+      - name: Upload .deb artifact
+        if: matrix.deb_arch != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-deb
+          path: chunkloader_*.deb
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute sha256 hashes
+        id: hashes
+        run: |
+          echo "darwin_arm64=$(sha256sum artifacts/chunkloader-darwin-arm64/chunkloader-darwin-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_amd64=$(sha256sum artifacts/chunkloader-linux-amd64/chunkloader-linux-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum artifacts/chunkloader-linux-arm64/chunkloader-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Formula/chunkloader.rb
+        run: |
+          cat > Formula/chunkloader.rb << 'FORMULA'
+          class Chunkloader < Formula
+            desc "Dump webpack / Next.js / Framer / Flutter JS chunks and assets for analysis"
+            homepage "https://github.com/Sn0wAlice/chunkloader"
+            version "${{ steps.version.outputs.version }}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Sn0wAlice/chunkloader/releases/download/v#{version}/chunkloader-darwin-arm64.tar.gz"
+                sha256 "${{ steps.hashes.outputs.darwin_arm64 }}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel?
+                url "https://github.com/Sn0wAlice/chunkloader/releases/download/v#{version}/chunkloader-linux-amd64.tar.gz"
+                sha256 "${{ steps.hashes.outputs.linux_amd64 }}"
+              elsif Hardware::CPU.arm?
+                url "https://github.com/Sn0wAlice/chunkloader/releases/download/v#{version}/chunkloader-linux-arm64.tar.gz"
+                sha256 "${{ steps.hashes.outputs.linux_arm64 }}"
+              end
+            end
+
+            def install
+              bin.install "chunkloader"
+            end
+
+            test do
+              assert_match "Usage", shell_output("#{bin}/chunkloader --help")
+            end
+          end
+          FORMULA
+          sed -i 's/^          //' Formula/chunkloader.rb
+
+      - name: Push updated formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/chunkloader.rb
+          git commit -m "chore: update Homebrew formula to v${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/chunkloader-darwin-arm64/*.tar.gz
+            artifacts/chunkloader-linux-amd64/*.tar.gz
+            artifacts/chunkloader-linux-arm64/*.tar.gz
+            artifacts/chunkloader-linux-amd64-deb/*.deb
+            artifacts/chunkloader-linux-arm64-deb/*.deb

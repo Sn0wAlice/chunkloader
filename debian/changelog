@@ -1,0 +1,12 @@
+chunkloader (0.1.0) stable; urgency=medium
+
+  * Initial release.
+  * webpack / Next.js chunk extraction (standard chunks, webpack runtime,
+    __BUILD_MANIFEST as function or object, "modern" chunks).
+  * Native ESM support (Framer / rolldown / rollup / Vite): recursive crawl
+    of the module import graph, including backtick dynamic imports.
+  * Flutter Web support: download every resource listed in
+    flutter_service_worker.js (main.dart.js, assets, fonts, canvaskit, ...).
+  * Automatic entry detection from a page URL, parallel downloads.
+
+ -- Sn0wAlice <github@sn0w.io>  Tue, 07 Jul 2026 00:00:00 +0000

@@ -1,47 +1,60 @@
 # chunkloader
 
-Portage en Rust de l'extension navigateur **Chunk Loader**.
+Rust port of the **Chunk Loader** browser extension.
 
-Au lieu d'injecter les chunks JS dans une page, ce CLI les **télécharge dans un
-dossier local** pour analyse hors-ligne (reverse, audit, source recovery de bundles
-webpack / Next.js).
+Instead of injecting JS chunks into a page, this CLI **downloads them into a local
+folder** for offline analysis (reversing, auditing, source recovery of
+webpack / Next.js bundles).
 
-## Ce que ça fait
+## What it does
 
-À partir d'un domaine ou d'une URL de fichier JS d'entrée, il :
+Given a domain or a JS entry-file URL, it:
 
-1. **détecte le fichier d'entrée** (auto-search sur les `<script src>` de la page,
-   mêmes patterns que l'extension : `_buildManifest.js`, `main.*.js`, `runtime-*.js`,
-   `webpack-runtime-*.js`, `app-*.js`, `*.modern.js`, …) ;
-2. **extrait la liste des chunks** selon 5 stratégies reprises de `content.js` :
-   - Next.js `__BUILD_MANIFEST` sous forme de fonction (évaluée en JS via `boa_engine`),
-   - Next.js `__BUILD_MANIFEST` sous forme d'objet,
-   - chunks « modern » (`return o.p + "" + {…}`),
-   - runtime webpack (deux maps `{id:"name"}` combinées en `name1-name2`),
-   - chunks webpack standard (`{id:"hash"}` → `id.hash.<ext>`) ;
-3. **télécharge** tout (entrée + chunks) en parallèle, en conservant l'arborescence
-   des URLs sous `dump/<host>/`.
+1. **detects the entry file** (auto-search on the page's `<script src>` tags, same
+   patterns as the extension: `_buildManifest.js`, `main.*.js`, `runtime-*.js`,
+   `webpack-runtime-*.js`, `app-*.js`, `*.modern.js`, …);
+2. **extracts the chunk list** using several strategies:
+   - Next.js `__BUILD_MANIFEST` as a function (evaluated in JS via `boa_engine`),
+   - Next.js `__BUILD_MANIFEST` as an object,
+   - "modern" chunks (`return o.p + "" + {…}`),
+   - webpack runtime (two `{id:"name"}` maps combined into `name1-name2`),
+   - standard webpack chunks (`{id:"hash"}` → `id.hash.<ext>`),
+   - **native ESM** (Framer / rolldown / rollup / Vite): recursive crawl of the
+     import graph (`import` / `from` / `import(\`./chunk.mjs\`)`), bounded to the same host,
+   - **Flutter Web**: reads the `flutter_service_worker.js` manifest
+     (`RESOURCES = {…}`) → downloads `main.dart.js`, assets, fonts, translations,
+     canvaskit, etc.;
+3. **downloads** everything (entry + chunks) in parallel, preserving the URL
+   directory structure under `dump/<host>/`.
+
+## Supported targets
+
+| Type | Detection | What gets dumped |
+|------|-----------|------------------|
+| webpack / Next.js | entry pattern (`runtime-*.js`, `_buildManifest.js`, …) | all chunks resolved from the maps |
+| native ESM (Framer, Vite…) | `.mjs` entry | full import graph (recursive) |
+| Flutter Web | page that bootstraps Flutter | every resource in the service worker |
 
 ## Build
 
 ```bash
 cargo build --release
-# binaire : ./target/release/chunkloader
+# binary: ./target/release/chunkloader
 ```
 
 ## Usage
 
 ```bash
-# À partir d'un domaine (auto-détection de l'entrée)
+# From a domain (auto-detect the entry)
 chunkloader https://example.com
 
-# À partir d'une URL de fichier JS directe
+# From a direct JS entry URL
 chunkloader https://example.com/_next/static/chunks/webpack-abc123.js
 
-# Juste détecter l'entrée sans télécharger
+# Just detect the entry without downloading
 chunkloader https://example.com --entry-only
 
-# Traiter TOUTES les entrées trouvées sur la page
+# Process ALL entries found on the page
 chunkloader https://example.com --all-entries
 ```
 
@@ -49,15 +62,15 @@ chunkloader https://example.com --all-entries
 
 | Option | Description |
 |--------|-------------|
-| `-o, --out <dir>` | Dossier de sortie (défaut : `dump/<host>`) |
-| `-b, --base <path>` | Force le base path de résolution des chunks |
-| `-e, --ext <ext>` | Force l'extension des chunks (`.chunk.js`, `.js`, …) |
-| `--entry-only` | Détecte et affiche l'entrée, sans rien télécharger |
-| `--all-entries` | Traite chaque entrée détectée, pas seulement la meilleure |
-| `-j, --jobs <n>` | Téléchargements parallèles (défaut : 8) |
-| `--insecure` | Accepte les certificats TLS invalides |
-| `--user-agent <ua>` | User-Agent personnalisé |
+| `-o, --out <dir>` | Output directory (default: `dump/<host>`) |
+| `-b, --base <path>` | Override the base path used to resolve chunks |
+| `-e, --ext <ext>` | Override the chunk extension (`.chunk.js`, `.js`, …) |
+| `--entry-only` | Detect and print the entry, without downloading |
+| `--all-entries` | Process every detected entry, not just the best one |
+| `-j, --jobs <n>` | Parallel downloads (default: 8) |
+| `--insecure` | Accept invalid TLS certificates |
+| `--user-agent <ua>` | Custom User-Agent |
 
 ## Note
 
-Outil d'analyse : à n'utiliser que sur des cibles que vous êtes autorisé à tester.
+Analysis tool: only use it against targets you are authorized to test.

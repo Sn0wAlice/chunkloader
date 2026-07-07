@@ -2,7 +2,12 @@
 name = "chunkloader"
 version = "0.1.0"
 edition = "2021"
-description = "Dump webpack / Next.js JS chunks from a site into a local folder for analysis (Rust port of the Chunk Loader browser extension)"
+description = "Dump webpack / Next.js / Framer / Flutter JS chunks and assets from a site into a local folder for analysis"
+authors = ["Sn0wAlice"]
+license = "Apache-2.0"
+repository = "https://github.com/Sn0wAlice/chunkloader"
+homepage = "https://github.com/Sn0wAlice/chunkloader"
+readme = "README.md"
 
 [[bin]]
 name = "chunkloader"
