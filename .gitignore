@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Dumped output
+/dump
+
+# Editor / OS
+.idea/
+.DS_Store
