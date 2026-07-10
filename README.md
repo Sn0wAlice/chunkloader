@@ -21,11 +21,18 @@ Given a domain or a JS entry-file URL, it:
    - standard webpack chunks (`{id:"hash"}` → `id.hash.<ext>`),
    - **native ESM** (Framer / rolldown / rollup / Vite): recursive crawl of the
      import graph (`import` / `from` / `import(\`./chunk.mjs\`)`), bounded to the same host,
+   - **Next.js App Router build manifest** (`/_next/static/<buildId>/_buildManifest.js`,
+     best-effort when a build id is present on the page),
    - **Flutter Web**: reads the `flutter_service_worker.js` manifest
      (`RESOURCES = {…}`) → downloads `main.dart.js`, assets, fonts, translations,
      canvaskit, etc.;
-3. **downloads** everything (entry + chunks) in parallel, preserving the URL
-   directory structure under `dump/<host>/`.
+3. **falls back** to every same-host `<script>` / preloaded script referenced by
+   the page when no chunk map resolves (e.g. minimal App Router builds), and
+   always captures referenced **stylesheets** (`<link rel="stylesheet">` plus
+   `.css` paths embedded in the inline RSC/flight payload);
+4. **downloads** everything (entry + chunks + assets) in parallel, preserving the
+   URL directory structure under `dump/<host>/`. HTML soft-404s served under a
+   `.js`/`.css` URL are detected and skipped instead of being saved as code.
 
 ## Supported targets
 
@@ -34,8 +41,34 @@ Given a domain or a JS entry-file URL, it:
 | webpack / Next.js | entry pattern (`runtime-*.js`, `_buildManifest.js`, …) | all chunks resolved from the maps |
 | native ESM (Framer, Vite…) | `.mjs` entry | full import graph (recursive) |
 | Flutter Web | page that bootstraps Flutter | every resource in the service worker |
+| any page (fallback) | no chunk map resolves | every same-host `<script>` + stylesheet on the page |
 
-## Build
+## Installation
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap Sn0wAlice/chunkloader https://github.com/Sn0wAlice/chunkloader
+brew install chunkloader
+```
+
+### Pre-built binary
+
+Grab the latest `.tar.gz` (or `.deb` on Debian/Ubuntu) for your platform from the
+[Releases](https://github.com/Sn0wAlice/chunkloader/releases/latest) page:
+
+```bash
+tar xzf chunkloader-linux-amd64.tar.gz
+sudo install -m755 chunkloader /usr/local/bin/
+```
+
+On Debian/Ubuntu:
+
+```bash
+sudo dpkg -i chunkloader_*_amd64.deb
+```
+
+### From source
 
 ```bash
 cargo build --release
