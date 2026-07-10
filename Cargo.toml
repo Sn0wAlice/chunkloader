@@ -1,6 +1,6 @@
 [package]
 name = "chunkloader"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 description = "Dump webpack / Next.js / Framer / Flutter JS chunks and assets from a site into a local folder for analysis"
 authors = ["Sn0wAlice"]

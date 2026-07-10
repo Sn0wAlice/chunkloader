@@ -3,13 +3,16 @@
 use regex::Regex;
 use url::Url;
 
-use crate::chunks::parse_chunks;
+use crate::chunks::{parse_chunks, parse_runtime_maps};
 use crate::download::looks_like_html_str;
 
 /// Script-src patterns used to auto-detect the entry file on a page,
-/// in priority order (ported verbatim from popup.js).
+/// in priority order (ported verbatim from popup.js). The `runtime~` variant is
+/// CRA's external webpack runtime (when not inlined into the HTML) and is the
+/// richest entry, so it sits near the top.
 pub const ENTRY_PATTERNS: &[&str] = &[
     r"_buildManifest\.js(\?.*)?$",
+    r"runtime~[\w.]+\.js(\?.*)?$",
     r"main\.\w+(\.chunk)?\.js(\?.*)?$",
     r"main-\w+(\.chunk)?\.js(\?.*)?$",
     r"runtime\.\w+(\.chunk)?\.js(\?.*)?$",
@@ -32,6 +35,10 @@ pub struct Target {
     pub page_scripts: Vec<String>,
     /// Same-host stylesheets (`<link rel="stylesheet">` / preloaded styles).
     pub page_styles: Vec<String>,
+    /// Chunk URLs resolved from a webpack runtime inlined into the page HTML.
+    pub runtime_chunks: Vec<String>,
+    /// Assets listed in a CRA/webpack `asset-manifest.json` (JS, CSS, media, maps).
+    pub manifest_assets: Vec<String>,
     /// True when the input was a page we scanned (vs. a direct JS/ESM URL).
     pub from_page: bool,
     /// Raw HTML of the scanned page (empty for direct JS URLs).
@@ -59,6 +66,8 @@ pub fn scan_target(
             entries: vec![url.to_string()],
             page_scripts: Vec::new(),
             page_styles: Vec::new(),
+            runtime_chunks: Vec::new(),
+            manifest_assets: Vec::new(),
             from_page: false,
             html: String::new(),
             base_url: None,
@@ -133,6 +142,26 @@ pub fn scan_target(
         }
     }
 
+    // Inline <script> blocks (no src) often hold the webpack runtime with the
+    // chunk maps — CRA inlines it into the HTML by default. Parse each and
+    // resolve the chunk filenames against the page.
+    let mut runtime_chunks: Vec<String> = Vec::new();
+    let inline_re = Regex::new(r"(?is)<script\b([^>]*)>(.*?)</script>").unwrap();
+    for cap in inline_re.captures_iter(&html) {
+        if cap[1].contains("src=") {
+            continue; // external script, handled via srcs above
+        }
+        for rel in parse_runtime_maps(&cap[2]) {
+            if let Ok(abs) = base.join(&rel) {
+                push_unique(&mut runtime_chunks, abs.to_string());
+            }
+        }
+    }
+
+    // CRA / webpack `asset-manifest.json` (served at the site root) is the
+    // authoritative list of every build file — JS, CSS, media, fonts, and maps.
+    let manifest_assets = fetch_asset_manifest(client, &base);
+
     // Match srcs against entry patterns in priority order.
     let mut matches: Vec<String> = Vec::new();
     for pat in ENTRY_PATTERNS {
@@ -153,10 +182,58 @@ pub fn scan_target(
         entries,
         page_scripts,
         page_styles,
+        runtime_chunks,
+        manifest_assets,
         from_page: true,
         html,
         base_url: Some(base),
     })
+}
+
+/// Fetch `<origin>/asset-manifest.json` (CRA / webpack-manifest-plugin) and
+/// return every file path it lists, resolved to absolute URLs. Empty when the
+/// manifest is absent or unparseable.
+fn fetch_asset_manifest(client: &reqwest::blocking::Client, base: &Url) -> Vec<String> {
+    let manifest_url = match base.join("/asset-manifest.json") {
+        Ok(u) => u,
+        Err(_) => return Vec::new(),
+    };
+    let body = match client
+        .get(manifest_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+    {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    // Collect string values from the `files` object and/or `entrypoints` array,
+    // falling back to any string leaf if neither is present.
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(files) = json.get("files").and_then(|f| f.as_object()) {
+        paths.extend(files.values().filter_map(|v| v.as_str().map(String::from)));
+    }
+    if let Some(eps) = json.get("entrypoints").and_then(|e| e.as_array()) {
+        paths.extend(eps.iter().filter_map(|v| v.as_str().map(String::from)));
+    }
+    if paths.is_empty() {
+        if let Some(obj) = json.as_object() {
+            paths.extend(obj.values().filter_map(|v| v.as_str().map(String::from)));
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for p in paths {
+        if let Ok(abs) = base.join(&p) {
+            push_unique(&mut out, abs.to_string());
+        }
+    }
+    out
 }
 
 /// Push `s` onto `v` only if not already present (order-preserving dedup).

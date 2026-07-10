@@ -19,20 +19,32 @@ Given a domain or a JS entry-file URL, it:
    - "modern" chunks (`return o.p + "" + {…}`),
    - webpack runtime (two `{id:"name"}` maps combined into `name1-name2`),
    - standard webpack chunks (`{id:"hash"}` → `id.hash.<ext>`),
+   - **CRA / webpack chunk-filename maps** (`"static/js/" + (names[e]||e) + "." +
+     hashes[e] + ".chunk.js"`, JS **and** CSS), read from the entry **or from a
+     webpack runtime inlined into the page HTML** (CRA's default), honouring
+     `publicPath`,
    - **native ESM** (Framer / rolldown / rollup / Vite): recursive crawl of the
      import graph (`import` / `from` / `import(\`./chunk.mjs\`)`), bounded to the same host,
    - **Next.js App Router build manifest** (`/_next/static/<buildId>/_buildManifest.js`,
      best-effort when a build id is present on the page),
+   - **CRA / webpack `asset-manifest.json`** (served at the site root): the
+     authoritative list of every build file — JS, CSS, media, fonts and maps,
+     including assets no chunk map references,
    - **Flutter Web**: reads the `flutter_service_worker.js` manifest
      (`RESOURCES = {…}`) → downloads `main.dart.js`, assets, fonts, translations,
      canvaskit, etc.;
-3. **falls back** to every same-host `<script>` / preloaded script referenced by
-   the page when no chunk map resolves (e.g. minimal App Router builds), and
-   always captures referenced **stylesheets** (`<link rel="stylesheet">` plus
-   `.css` paths embedded in the inline RSC/flight payload);
-4. **downloads** everything (entry + chunks + assets) in parallel, preserving the
+3. **always captures** every same-host `<script>` / preloaded script referenced
+   by the page (eager chunks, runtime, env config, …) — the sole fallback when no
+   chunk map resolves — plus referenced **stylesheets** (`<link rel="stylesheet">`
+   and `.css` paths embedded in an inline RSC/flight payload);
+4. **harvests source maps** — fetches the `.map` sibling of every JS/CSS asset
+   (and any `.map` in the manifest) and **unpacks each `sourcesContent` into the
+   original source tree** under `dump/<host>/_sources/` — recovering the real
+   pre-bundle source. Disable with `--no-source-maps`, or keep the raw `.map`
+   without unpacking with `--no-extract`;
+5. **downloads** everything (entry + chunks + assets) in parallel, preserving the
    URL directory structure under `dump/<host>/`. HTML soft-404s served under a
-   `.js`/`.css` URL are detected and skipped instead of being saved as code.
+   `.js`/`.css`/`.map` URL are detected and skipped instead of being saved as code.
 
 ## Supported targets
 
@@ -101,6 +113,8 @@ chunkloader https://example.com --all-entries
 | `--entry-only` | Detect and print the entry, without downloading |
 | `--all-entries` | Process every detected entry, not just the best one |
 | `-j, --jobs <n>` | Parallel downloads (default: 8) |
+| `--no-source-maps` | Don't fetch `.map` source maps |
+| `--no-extract` | Fetch `.map` files but don't unpack their original sources |
 | `--insecure` | Accept invalid TLS certificates |
 | `--user-agent <ua>` | Custom User-Agent |
 

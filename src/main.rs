@@ -20,6 +20,7 @@ mod download;
 mod esm;
 mod flutter;
 mod scan;
+mod sourcemaps;
 
 use std::fs;
 use std::path::PathBuf;
@@ -77,6 +78,14 @@ struct Args {
         default_value = "Mozilla/5.0 (compatible; chunkloader/0.1; +https://github.com/)"
     )]
     user_agent: String,
+
+    /// Do not fetch `.map` source maps for downloaded JS/CSS.
+    #[arg(long)]
+    no_source_maps: bool,
+
+    /// Fetch source maps but do not unpack their original sources to disk.
+    #[arg(long)]
+    no_extract: bool,
 }
 
 fn main() {
@@ -172,6 +181,27 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         urls.extend(chunks);
     }
 
+    // Chunks resolved from a webpack runtime inlined into the page HTML
+    // (CRA's default): these are the lazy chunks not present as <script> tags.
+    if !target.runtime_chunks.is_empty() {
+        resolved_chunks = true;
+        eprintln!(
+            "Inline runtime: {} chunk(s) discovered",
+            target.runtime_chunks.len()
+        );
+        urls.extend(target.runtime_chunks.iter().cloned());
+    }
+
+    // CRA / webpack asset-manifest.json: authoritative list of every build file
+    // (JS, CSS, media, fonts, maps) — catches assets no chunk map references.
+    if !target.manifest_assets.is_empty() {
+        eprintln!(
+            "asset-manifest.json: {} file(s) listed",
+            target.manifest_assets.len()
+        );
+        urls.extend(target.manifest_assets.iter().cloned());
+    }
+
     // Next.js build manifest (best-effort): enumerate route chunks the
     // webpack/runtime strategies don't expose (App Router builds especially).
     if target.from_page {
@@ -188,13 +218,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Fallback: if no chunk map resolved anything, grab every same-host
-    // <script>/preloaded script referenced directly by the page.
-    if !resolved_chunks && !target.page_scripts.is_empty() {
-        eprintln!(
-            "No chunk map resolved; falling back to {} page script asset(s).",
-            target.page_scripts.len()
-        );
+    // Same-host <script>/preloaded scripts on the page are always part of the
+    // bundle: eager chunks, runtime, env-config, etc. When nothing else
+    // resolved they're also the sole fallback.
+    if !target.page_scripts.is_empty() {
+        if resolved_chunks {
+            eprintln!(
+                "Including {} same-host page <script> asset(s).",
+                target.page_scripts.len()
+            );
+        } else {
+            eprintln!(
+                "No chunk map resolved; using {} page <script> asset(s).",
+                target.page_scripts.len()
+            );
+        }
         urls.extend(target.page_scripts.iter().cloned());
     }
 
@@ -211,12 +249,30 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if urls.is_empty() {
         return Ok(());
     }
+
+    // Source maps are fetched (and unpacked) by a dedicated tolerant pass, not
+    // the main download — a missing `.map` is expected, not a failure.
+    let (map_urls, asset_urls): (Vec<String>, Vec<String>) = urls
+        .into_iter()
+        .partition(|u| u.split('?').next().unwrap_or("").ends_with(".map"));
+
     eprintln!(
         "Downloading {} file(s) into {} ...",
-        urls.len(),
+        asset_urls.len(),
         out_dir.display()
     );
-    download_all(&client, &urls, &out_dir, args.jobs);
+    download_all(&client, &asset_urls, &out_dir, args.jobs);
+
+    if !args.no_source_maps {
+        sourcemaps::harvest(
+            &client,
+            &asset_urls,
+            &map_urls,
+            &out_dir,
+            args.jobs,
+            !args.no_extract,
+        );
+    }
     Ok(())
 }
 

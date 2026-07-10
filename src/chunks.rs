@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use regex::Regex;
+use url::Url;
 
 /// Returns the list of absolute chunk URLs discovered in `body`.
 pub fn parse_chunks(body: &str, entry_url: &str, base_path: &str, ext: &str) -> Vec<String> {
@@ -27,10 +28,95 @@ pub fn parse_chunks(body: &str, entry_url: &str, base_path: &str, ext: &str) -> 
     if let Some(c) = modern.captures(body) {
         return handle_modern(&c[1], base_path);
     }
+    // CRA / webpack runtime chunk-filename maps, e.g.
+    //   "static/js/" + (names[e]||e) + "." + hashes[e] + ".chunk.js"
+    // resolved against the entry URL (which carries the origin + publicPath).
+    let runtime = parse_runtime_maps(body);
+    if !runtime.is_empty() {
+        if let Ok(base) = Url::parse(entry_url) {
+            return runtime
+                .iter()
+                .filter_map(|p| base.join(p).ok().map(|u| u.to_string()))
+                .collect();
+        }
+    }
     if entry_url.contains("webpack-runtime-") || entry_url.contains("runtime-") {
         return handle_webpack_runtime(body, base_path, ext);
     }
     handle_standard(body, base_path, ext)
+}
+
+/// Parse a webpack/CRA runtime script's chunk-filename builder(s) into chunk
+/// paths (prefixed with `publicPath`, ready to resolve against the page/entry).
+///
+/// Handles both the plain form `"<prefix>" + e + "." + {hashes}[e] + "<suffix>"`
+/// and the named form `"<prefix>" + ({names}[e] || e) + "." + {hashes}[e] +
+/// "<suffix>"`, for JS (`static/js/….chunk.js`) and CSS (`static/css/….chunk.css`)
+/// alike. Returns an empty vec when the script has no such builder.
+pub fn parse_runtime_maps(script: &str) -> Vec<String> {
+    let public_path = Regex::new(r#"\.p\s*=\s*"([^"]*)""#)
+        .unwrap()
+        .captures(script)
+        .map(|c| c[1].to_string())
+        .filter(|p| p != "auto")
+        .unwrap_or_else(|| "/".to_string());
+
+    // Prepend publicPath unless the prefix is already absolute (leading '/' or a
+    // full URL), to avoid producing a protocol-relative `//host` path.
+    let build = |prefix: &str, name: &str, hash: &str, suffix: &str| -> String {
+        let tail = format!("{name}.{hash}{suffix}");
+        if prefix.starts_with('/') || prefix.starts_with("http") {
+            format!("{prefix}{tail}")
+        } else {
+            format!("{public_path}{prefix}{tail}")
+        }
+    };
+    let wanted = |prefix: &str, suffix: &str| {
+        prefix.contains('/') && (suffix.ends_with(".js") || suffix.ends_with(".css"))
+    };
+
+    let mut out: Vec<String> = Vec::new();
+
+    // Named form: "<prefix>" + ({names}[e] || e) + "." + {hashes}[e] + "<suffix>"
+    let named = Regex::new(
+        r#""([^"]*)"\s*\+\s*\(\s*(\{[^{}]*\})\s*\[\s*\w+\s*\]\s*\|\|\s*\w+\s*\)\s*\+\s*"\."\s*\+\s*(\{[^{}]*\})\s*\[\s*\w+\s*\]\s*\+\s*"([^"]*)""#,
+    )
+    .unwrap();
+    for c in named.captures_iter(script) {
+        let (prefix, suffix) = (&c[1], &c[4]);
+        if !wanted(prefix, suffix) {
+            continue;
+        }
+        let names = json_num_map(&c[2]).unwrap_or_default();
+        let hashes = json_num_map(&c[3]).unwrap_or_default();
+        for (id, hash) in &hashes {
+            let name = names.get(id).cloned().unwrap_or_else(|| id.clone());
+            out.push(build(prefix, &name, hash, suffix));
+        }
+    }
+
+    // Plain form: "<prefix>" + e + "." + {hashes}[e] + "<suffix>"
+    let plain = Regex::new(
+        r#""([^"]*)"\s*\+\s*\w+\s*\+\s*"\."\s*\+\s*(\{[^{}]*\})\s*\[\s*\w+\s*\]\s*\+\s*"([^"]*)""#,
+    )
+    .unwrap();
+    for c in plain.captures_iter(script) {
+        let (prefix, suffix) = (&c[1], &c[3]);
+        if !wanted(prefix, suffix) {
+            continue;
+        }
+        let hashes = match json_num_map(&c[2]) {
+            Some(m) => m,
+            None => continue,
+        };
+        for (id, hash) in &hashes {
+            out.push(build(prefix, id, hash, suffix));
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Next.js build manifest: evaluate the JS expression and gather every array
