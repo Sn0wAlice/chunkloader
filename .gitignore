@@ -14,3 +14,5 @@
 /debian/chunkloader/
 /debian/.debhelper/
 /debian/files
+
+vhs
