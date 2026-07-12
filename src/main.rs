@@ -21,6 +21,7 @@ mod esm;
 mod flutter;
 mod scan;
 mod sourcemaps;
+mod ui;
 
 use std::fs;
 use std::path::PathBuf;
@@ -34,6 +35,19 @@ use crate::download::download_all;
 use crate::esm::{crawl_esm, is_esm};
 use crate::flutter::{detect_flutter, handle_flutter};
 use crate::scan::{derive_base_path, derive_extension, discover_next_manifest_chunks, scan_target};
+use crate::ui::{Card, Line};
+
+/// Discovery tallies gathered while resolving a target, rendered into the
+/// final summary card.
+#[derive(Default)]
+struct Discovery {
+    chunks: usize,
+    runtime: usize,
+    manifest: usize,
+    next_manifest: usize,
+    scripts: usize,
+    styles: usize,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,8 +119,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // 0. Flutter web app? Its "chunks" are listed in flutter_service_worker.js.
     if let Some(sw_url) = detect_flutter(&client, &args.url)? {
-        eprintln!("Flutter web app detected.");
-        eprintln!("Service worker manifest: {sw_url}");
         if args.entry_only {
             println!("{sw_url}");
             return Ok(());
@@ -114,22 +126,16 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let host = Url::parse(&sw_url)?.host_str().unwrap_or("dump").to_string();
         let out_dir = out_dir_for(args, &host);
         fs::create_dir_all(&out_dir)?;
-        handle_flutter(&client, &sw_url, &out_dir, args.jobs)?;
+        let stats = handle_flutter(&client, &sw_url, &out_dir, args.jobs)?;
+        render_card(&host, "Flutter web app", &Discovery::default(), &stats, None, &out_dir);
         return Ok(());
     }
 
     // 1. Figure out the entry URL(s) and scan the page for downloadable assets.
+    eprintln!("{} {}", ui::dim("▸ scanning"), ui::bold(&args.url));
     let target = scan_target(&client, &args.url, args.all_entries)?;
     if target.entries.is_empty() && target.page_scripts.is_empty() {
         return Err("no suitable JS entry file found".into());
-    }
-    if target.entries.is_empty() {
-        eprintln!("No entry pattern matched; using page <script> assets.");
-    } else {
-        eprintln!("Entry file(s) detected:");
-        for e in &target.entries {
-            eprintln!("  {e}");
-        }
     }
     if args.entry_only {
         for e in &target.entries {
@@ -137,6 +143,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    let mut disco = Discovery::default();
 
     // 2. Resolve chunks for every entry, then layer page-level assets on top.
     let host = target
@@ -150,13 +157,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&out_dir)?;
 
     let mut urls: Vec<String> = Vec::new();
-    let mut resolved_chunks = false;
+    let mut esm_stats = download::DownloadStats::default();
 
     for entry in &target.entries {
         if is_esm(entry) {
             // Native ESM: crawl the module import graph recursively.
-            eprintln!("\n{entry}: native ESM module — crawling import graph ...");
-            crawl_esm(&client, entry, &out_dir, args.jobs);
+            let (ok, failed) = crawl_esm(&client, entry, &out_dir, args.jobs);
+            esm_stats.ok += ok;
+            esm_stats.failed += failed;
             continue;
         }
 
@@ -170,35 +178,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         urls.push(entry.clone()); // keep the entry itself
         let chunks = parse_chunks(&entry_body, entry, &base_path, &ext);
-        eprintln!(
-            "{}: {} chunk(s) discovered (base={base_path}, ext={ext})",
-            entry,
-            chunks.len()
-        );
-        if !chunks.is_empty() {
-            resolved_chunks = true;
-        }
+        disco.chunks += chunks.len();
         urls.extend(chunks);
     }
 
     // Chunks resolved from a webpack runtime inlined into the page HTML
     // (CRA's default): these are the lazy chunks not present as <script> tags.
     if !target.runtime_chunks.is_empty() {
-        resolved_chunks = true;
-        eprintln!(
-            "Inline runtime: {} chunk(s) discovered",
-            target.runtime_chunks.len()
-        );
+        disco.runtime = target.runtime_chunks.len();
         urls.extend(target.runtime_chunks.iter().cloned());
     }
 
     // CRA / webpack asset-manifest.json: authoritative list of every build file
     // (JS, CSS, media, fonts, maps) — catches assets no chunk map references.
     if !target.manifest_assets.is_empty() {
-        eprintln!(
-            "asset-manifest.json: {} file(s) listed",
-            target.manifest_assets.len()
-        );
+        disco.manifest = target.manifest_assets.len();
         urls.extend(target.manifest_assets.iter().cloned());
     }
 
@@ -207,48 +201,24 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if target.from_page {
         if let Some(base) = &target.base_url {
             let manifest_chunks = discover_next_manifest_chunks(&client, &target.html, base);
-            if !manifest_chunks.is_empty() {
-                resolved_chunks = true;
-                eprintln!(
-                    "Next build manifest: {} chunk(s) discovered",
-                    manifest_chunks.len()
-                );
-                urls.extend(manifest_chunks);
-            }
+            disco.next_manifest = manifest_chunks.len();
+            urls.extend(manifest_chunks);
         }
     }
 
     // Same-host <script>/preloaded scripts on the page are always part of the
     // bundle: eager chunks, runtime, env-config, etc. When nothing else
     // resolved they're also the sole fallback.
-    if !target.page_scripts.is_empty() {
-        if resolved_chunks {
-            eprintln!(
-                "Including {} same-host page <script> asset(s).",
-                target.page_scripts.len()
-            );
-        } else {
-            eprintln!(
-                "No chunk map resolved; using {} page <script> asset(s).",
-                target.page_scripts.len()
-            );
-        }
-        urls.extend(target.page_scripts.iter().cloned());
-    }
+    disco.scripts = target.page_scripts.len();
+    urls.extend(target.page_scripts.iter().cloned());
 
     // Stylesheets are part of the bundle for offline auditing.
-    if !target.page_styles.is_empty() {
-        eprintln!("Including {} stylesheet(s).", target.page_styles.len());
-        urls.extend(target.page_styles.iter().cloned());
-    }
+    disco.styles = target.page_styles.len();
+    urls.extend(target.page_styles.iter().cloned());
 
     // Dedup while preserving order.
     let mut seen = std::collections::HashSet::new();
     urls.retain(|u| seen.insert(u.clone()));
-
-    if urls.is_empty() {
-        return Ok(());
-    }
 
     // Source maps are fetched (and unpacked) by a dedicated tolerant pass, not
     // the main download — a missing `.map` is expected, not a failure.
@@ -256,24 +226,117 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .partition(|u| u.split('?').next().unwrap_or("").ends_with(".map"));
 
-    eprintln!(
-        "Downloading {} file(s) into {} ...",
-        asset_urls.len(),
-        out_dir.display()
-    );
-    download_all(&client, &asset_urls, &out_dir, args.jobs);
+    let mut stats = download_all(&client, &asset_urls, &out_dir, args.jobs);
+    // Fold ESM crawl results into the overall download tally.
+    stats.ok += esm_stats.ok;
+    stats.failed += esm_stats.failed;
 
-    if !args.no_source_maps {
-        sourcemaps::harvest(
+    let smaps = if !args.no_source_maps {
+        Some(sourcemaps::harvest(
             &client,
             &asset_urls,
             &map_urls,
             &out_dir,
             args.jobs,
             !args.no_extract,
-        );
-    }
+        ))
+    } else {
+        None
+    };
+
+    // Subtitle: the detected entry file (or the page-assets fallback).
+    let subtitle = match target.entries.first() {
+        Some(first) => {
+            let name = first.split('?').next().unwrap_or(first).rsplit('/').next().unwrap_or(first);
+            if target.entries.len() > 1 {
+                format!("{name}  +{} more", target.entries.len() - 1)
+            } else {
+                name.to_string()
+            }
+        }
+        None => "page <script> assets".to_string(),
+    };
+
+    render_card(&host, &subtitle, &disco, &stats, smaps.as_ref(), &out_dir);
     Ok(())
+}
+
+/// Render the final coloured summary card to stderr.
+fn render_card(
+    host: &str,
+    subtitle: &str,
+    disco: &Discovery,
+    stats: &download::DownloadStats,
+    smaps: Option<&sourcemaps::SourceMapStats>,
+    out_dir: &PathBuf,
+) {
+    let chunks_total = disco.chunks + disco.runtime + disco.next_manifest;
+    let mut card = Card::new(&format!("chunkloader · {host}"), ui::BRAND);
+
+    // The detected entry / target, then a blank spacer.
+    card = card
+        .line(Line::new().styled("2", subtitle))
+        .blank();
+
+    // Discovery breakdown — only show rows that carry a signal.
+    let mut disco_rows: Vec<Line> = Vec::new();
+    let mut row = Line::new();
+    let mut cells = 0;
+    let push = |row: &mut Line, cells: &mut usize, rows: &mut Vec<Line>, label: &str, n: usize, code: &str| {
+        if n == 0 {
+            return;
+        }
+        *row = std::mem::take(row).stat(label, n, code);
+        *cells += 1;
+        if *cells == 2 {
+            rows.push(std::mem::take(row));
+            *cells = 0;
+        }
+    };
+    push(&mut row, &mut cells, &mut disco_rows, "chunks", chunks_total, ui::CHUNK);
+    push(&mut row, &mut cells, &mut disco_rows, "assets", disco.manifest, ui::ASSET);
+    push(&mut row, &mut cells, &mut disco_rows, "scripts", disco.scripts, ui::SCRIPT);
+    push(&mut row, &mut cells, &mut disco_rows, "styles", disco.styles, ui::STYLE);
+    if let Some(s) = smaps {
+        push(&mut row, &mut cells, &mut disco_rows, "maps", s.fetched, ui::SOURCE);
+        push(&mut row, &mut cells, &mut disco_rows, "sources", s.sources, ui::SOURCE);
+    }
+    if cells > 0 {
+        disco_rows.push(row);
+    }
+    for r in disco_rows {
+        card = card.line(r);
+    }
+
+    // Result line with status glyphs.
+    card = card.blank().line(
+        Line::new()
+            .styled(ui::OK, &format!("✓ {} downloaded", stats.ok))
+            .plain("   ")
+            .styled(
+                if stats.skipped > 0 { ui::WARN } else { "2" },
+                &format!("⚠ {} skipped", stats.skipped),
+            )
+            .plain("   ")
+            .styled(
+                if stats.failed > 0 { ui::FAIL } else { "2" },
+                &format!("✗ {} failed", stats.failed),
+            ),
+    );
+
+    card = card
+        .blank()
+        .line(Line::new().styled("2", "→ ").styled("2", &out_dir.display().to_string()));
+
+    card.print();
+
+    // Detailed failures below the card, if any.
+    if !stats.errors.is_empty() {
+        eprintln!("{}", ui::paint(ui::FAIL, "failures:"));
+        for e in &stats.errors {
+            eprintln!("  {}", ui::dim(e));
+        }
+    }
 }
 
 /// Output directory: `--out` override, else `dump/<host>`.

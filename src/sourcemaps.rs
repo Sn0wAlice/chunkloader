@@ -12,6 +12,13 @@ use crate::download::local_path_for;
 
 /// For every JS/CSS asset (and every explicit `.map` URL), fetch the source map
 /// and, when `extract` is set, write each original source under `<out>/_sources/`.
+/// Number of `.map` files fetched and original source files unpacked.
+#[derive(Default)]
+pub struct SourceMapStats {
+    pub fetched: usize,
+    pub sources: usize,
+}
+
 pub fn harvest(
     client: &reqwest::blocking::Client,
     assets: &[String],
@@ -19,7 +26,7 @@ pub fn harvest(
     out_dir: &Path,
     jobs: usize,
     extract: bool,
-) {
+) -> SourceMapStats {
     // Candidate map URLs: the ones we already know about, plus a `.map` sibling
     // for each downloaded JS/CSS asset.
     let mut maps: Vec<String> = Vec::new();
@@ -41,7 +48,7 @@ pub fn harvest(
         }
     }
     if maps.is_empty() {
-        return;
+        return SourceMapStats::default();
     }
 
     let fetched = AtomicUsize::new(0);
@@ -84,17 +91,9 @@ pub fn harvest(
         });
     });
 
-    let fetched = fetched.load(Ordering::Relaxed);
-    let sources = sources.load(Ordering::Relaxed);
-    if fetched > 0 {
-        if extract {
-            eprintln!(
-                "Source maps: {fetched} fetched, {sources} original source file(s) extracted to {}/_sources",
-                out_dir.display()
-            );
-        } else {
-            eprintln!("Source maps: {fetched} fetched.");
-        }
+    SourceMapStats {
+        fetched: fetched.load(Ordering::Relaxed),
+        sources: sources.load(Ordering::Relaxed),
     }
 }
 

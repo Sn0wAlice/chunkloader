@@ -5,7 +5,7 @@ use std::path::Path;
 use regex::Regex;
 use url::Url;
 
-use crate::download::download_all;
+use crate::download::{download_all, DownloadStats};
 
 /// Detect a Flutter web target and return the URL of its
 /// `flutter_service_worker.js` (which lists every app resource).
@@ -49,20 +49,25 @@ pub fn handle_flutter(
     sw_url: &str,
     out_dir: &Path,
     jobs: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<DownloadStats, Box<dyn std::error::Error>> {
     let base = Url::parse(sw_url)?;
 
     // Fetch the service worker; fall back to the bare essentials if absent.
     let sw_body = match client.get(sw_url).send().and_then(|r| r.error_for_status()) {
         Ok(resp) => resp.text()?,
         Err(e) => {
-            eprintln!("warning: could not fetch service worker ({e}); falling back to core files");
+            eprintln!(
+                "{}",
+                crate::ui::paint(
+                    crate::ui::WARN,
+                    &format!("service worker unavailable ({e}); using core files")
+                )
+            );
             let fallback = ["index.html", "flutter_bootstrap.js", "flutter.js", "main.dart.js"]
                 .iter()
                 .filter_map(|f| base.join(f).ok().map(|u| u.to_string()))
                 .collect::<Vec<_>>();
-            download_all(client, &fallback, out_dir, jobs);
-            return Ok(());
+            return Ok(download_all(client, &fallback, out_dir, jobs));
         }
     };
 
@@ -82,13 +87,7 @@ pub fn handle_flutter(
     let mut seen = std::collections::HashSet::new();
     urls.retain(|u| seen.insert(u.clone()));
 
-    eprintln!(
-        "{} resource(s) listed in the manifest. Downloading into {} ...",
-        urls.len(),
-        out_dir.display()
-    );
-    download_all(client, &urls, out_dir, jobs);
-    Ok(())
+    Ok(download_all(client, &urls, out_dir, jobs))
 }
 
 /// Extract resource paths from the `RESOURCES = { "path": "hash", ... }` map

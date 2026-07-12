@@ -2,6 +2,7 @@
 //! follow the module import graph, bounded to the entry's host.
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -18,12 +19,18 @@ pub fn is_esm(url: &str) -> bool {
 
 /// Breadth-first crawl of an ESM import graph, staying on the entry's host.
 /// Each fetched module is saved to disk and scanned for further imports.
-pub fn crawl_esm(client: &reqwest::blocking::Client, entry: &str, out_dir: &Path, jobs: usize) {
+/// Returns `(modules_saved, failed)`.
+pub fn crawl_esm(
+    client: &reqwest::blocking::Client,
+    entry: &str,
+    out_dir: &Path,
+    jobs: usize,
+) -> (usize, usize) {
     let host = match Url::parse(entry).ok().and_then(|u| u.host_str().map(String::from)) {
         Some(h) => h,
         None => {
-            eprintln!("error: invalid entry URL {entry}");
-            return;
+            eprintln!("{}", crate::ui::paint(crate::ui::FAIL, &format!("invalid entry URL {entry}")));
+            return (0, 0);
         }
     };
 
@@ -48,10 +55,7 @@ pub fn crawl_esm(client: &reqwest::blocking::Client, entry: &str, out_dir: &Path
                         let text = String::from_utf8_lossy(&bytes);
                         (true, resolve_esm_imports(u, &text, &host))
                     }
-                    Err(e) => {
-                        eprintln!("  [fail] {u}  ({e})");
-                        (false, Vec::new())
-                    }
+                    Err(_) => (false, Vec::new()),
                 })
                 .collect()
         });
@@ -69,13 +73,23 @@ pub fn crawl_esm(client: &reqwest::blocking::Client, entry: &str, out_dir: &Path
                 }
             }
         }
-        if !next.is_empty() {
-            eprintln!("  crawled {ok} module(s), {} newly discovered ...", next.len());
+        if std::io::stderr().is_terminal() {
+            eprint!(
+                "\r\x1b[2K  {} {} {}",
+                crate::ui::paint(crate::ui::CHUNK, "crawling ESM"),
+                crate::ui::dim("modules"),
+                crate::ui::bold(&ok.to_string()),
+            );
+            let _ = std::io::stderr().flush();
         }
         frontier = next;
     }
 
-    eprintln!("Done: {ok} module(s) saved, {failed} failed.");
+    if std::io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+    (ok, failed)
 }
 
 /// Extract every module specifier from `import`/`from`/`import(...)` statements,

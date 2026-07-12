@@ -1,6 +1,7 @@
 //! Parallel downloading and HTML soft-404 detection.
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -8,11 +9,23 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use url::Url;
 
+use crate::ui;
+
 /// Result of downloading a single URL.
 pub enum Outcome {
-    Saved(PathBuf),
+    Saved,
     /// The URL looked like code but returned an HTML document (soft-404).
     SkippedHtml,
+}
+
+/// Tally of a download pass.
+#[derive(Default)]
+pub struct DownloadStats {
+    pub ok: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// `url (error)` for each failure, for optional detailed reporting.
+    pub errors: Vec<String>,
 }
 
 pub fn download_all(
@@ -20,11 +33,13 @@ pub fn download_all(
     urls: &[String],
     out_dir: &Path,
     jobs: usize,
-) {
+) -> DownloadStats {
     let ok = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let total = urls.len();
+    let progress = std::io::stderr().is_terminal();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs.max(1))
@@ -34,33 +49,51 @@ pub fn download_all(
     pool.install(|| {
         urls.par_iter().for_each(|u| {
             match download_one(client, u, out_dir) {
-                Ok(Outcome::Saved(path)) => {
-                    let n = ok.fetch_add(1, Ordering::Relaxed) + 1;
-                    eprintln!("  [ok {n}] {} -> {}", u, path.display());
+                Ok(Outcome::Saved) => {
+                    ok.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Outcome::SkippedHtml) => {
                     skipped.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("  [skip] {u}  (HTML response, not a code asset)");
                 }
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
                     errors.lock().unwrap().push(format!("{u}  ({e})"));
                 }
             }
+            if progress {
+                let done =
+                    ok.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
+                draw_progress(done, total);
+            }
         });
     });
 
-    let ok = ok.load(Ordering::Relaxed);
-    let skipped = skipped.load(Ordering::Relaxed);
-    let failed = failed.load(Ordering::Relaxed);
-    eprintln!("\nDone: {ok} downloaded, {skipped} skipped, {failed} failed.");
-    let errs = errors.into_inner().unwrap();
-    if !errs.is_empty() {
-        eprintln!("Failures:");
-        for e in errs {
-            eprintln!("  {e}");
-        }
+    if progress {
+        // Clear the progress line so the summary card starts clean.
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
     }
+
+    DownloadStats {
+        ok: ok.load(Ordering::Relaxed),
+        skipped: skipped.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+        errors: errors.into_inner().unwrap(),
+    }
+}
+
+/// Repaint the single-line download progress indicator in place.
+fn draw_progress(done: usize, total: usize) {
+    let width = 24usize;
+    let filled = if total == 0 { width } else { done * width / total };
+    let bar: String = "█".repeat(filled) + &"░".repeat(width - filled);
+    eprint!(
+        "\r\x1b[2K  {} {}  {}",
+        ui::paint(ui::CHUNK, &bar),
+        ui::dim("downloading"),
+        ui::bold(&format!("{done}/{total}")),
+    );
+    let _ = std::io::stderr().flush();
 }
 
 pub fn download_one(
@@ -68,7 +101,13 @@ pub fn download_one(
     url: &str,
     out_dir: &Path,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let resp = client.get(url).send()?.error_for_status()?;
+    let resp = client.get(url).send()?;
+    // A 404/410 on a speculatively-enumerated URL (Next build-manifest routes,
+    // `.map` siblings, …) means "not a real asset here" — a skip, not a failure.
+    if matches!(resp.status().as_u16(), 404 | 410) {
+        return Ok(Outcome::SkippedHtml);
+    }
+    let resp = resp.error_for_status()?;
     let content_type = header_content_type(&resp);
     let bytes = resp.bytes()?;
     if expects_code(url) && looks_like_html(&content_type, &bytes) {
@@ -79,7 +118,7 @@ pub fn download_one(
         fs::create_dir_all(parent)?;
     }
     fs::write(&path, &bytes)?;
-    Ok(Outcome::Saved(path))
+    Ok(Outcome::Saved)
 }
 
 /// Map a chunk URL to a relative path on disk, preserving directory structure
